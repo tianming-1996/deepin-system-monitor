@@ -718,6 +718,13 @@ qulonglong Process::memory() const
     return d->rss - d->shm;
 }
 
+void Process::setMemory(qulonglong memory)
+{
+    // Keep the existing shared-memory value intact. memory() exposes private
+    // resident memory (rss - shm), so store the aggregate in the same form.
+    d->rss = memory + d->shm;
+}
+
 qulonglong Process::vtrmemory() const
 {
     return d->vmsize;

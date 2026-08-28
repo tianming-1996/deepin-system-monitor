@@ -163,6 +163,16 @@ TEST_F(UT_Process, test_memory_001)
     EXPECT_EQ(memory, expect);
 }
 
+TEST_F(UT_Process, test_setMemory_001)
+{
+    m_tester->d->shm = 7;
+
+    m_tester->setMemory(50);
+
+    EXPECT_EQ(m_tester->memory(), 50U);
+    EXPECT_EQ(m_tester->d->rss, 57U);
+}
+
 TEST_F(UT_Process, test_vtrmemory_001)
 {
     qulonglong vtrmemory = m_tester->vtrmemory();

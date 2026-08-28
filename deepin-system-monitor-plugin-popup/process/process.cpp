@@ -612,6 +612,11 @@ qulonglong Process::memory() const
     return d->rss - d->shm;
 }
 
+void Process::setMemory(qulonglong memory)
+{
+    d->rss = memory + d->shm;
+}
+
 qulonglong Process::vtrmemory() const
 {
     return d->vmsize;

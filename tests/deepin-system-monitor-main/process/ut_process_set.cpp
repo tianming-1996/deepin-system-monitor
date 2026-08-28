@@ -6,6 +6,7 @@
 //self
 #include "process/process_set.h"
 #include "process/process_db.h"
+#include "process/private/process_p.h"
 #include "common/common.h"
 #include "wm/wm_window_list.h"
 
@@ -62,6 +63,120 @@ TEST_F(UT_ProcessSet, test_mergeSubProcCpu_001)
     qreal cpu = 0;
     m_tester->mergeSubProcCpu(ppid,cpu);
 
+}
+
+TEST_F(UT_ProcessSet, test_mergeSubProcMemory_001)
+{
+    Process root(101);
+    root.setMemory(13);
+    Process child1(102);
+    child1.setMemory(17);
+    Process child2(103);
+    child2.setMemory(20);
+
+    m_tester->m_set.insert(101, root);
+    m_tester->m_set.insert(102, child1);
+    m_tester->m_set.insert(103, child2);
+    m_tester->m_pidPtoCMapping.insert(101, 102);
+    m_tester->m_pidPtoCMapping.insert(101, 103);
+
+    qulonglong memory = 0;
+    m_tester->mergeSubProcMemory(101, memory);
+
+    EXPECT_EQ(memory, 50U);
+}
+
+TEST_F(UT_ProcessSet, test_aggregateProcessGroup_001)
+{
+    Process representative(101);
+    representative.setCpu(1);
+    representative.setNetIoBps(2, 3);
+    representative.setMemory(13);
+
+    Process child1(102);
+    child1.setCpu(2);
+    child1.setNetIoBps(4, 5);
+    child1.setMemory(17);
+
+    Process child2(103);
+    child2.setCpu(3);
+    child2.setNetIoBps(6, 7);
+    child2.setMemory(20);
+
+    m_tester->m_set.insert(representative.pid(), representative);
+    m_tester->m_set.insert(child1.pid(), child1);
+    m_tester->m_set.insert(child2.pid(), child2);
+
+    m_tester->aggregateProcessGroup(representative.pid(), {101, 102, 103, 103});
+
+    const Process result = m_tester->m_set.value(representative.pid());
+    EXPECT_DOUBLE_EQ(result.cpu(), 6);
+    EXPECT_DOUBLE_EQ(result.recvBps(), 12);
+    EXPECT_DOUBLE_EQ(result.sentBps(), 15);
+    EXPECT_EQ(result.memory(), 50U);
+}
+
+TEST_F(UT_ProcessSet, test_collapseDesktopLaunchGroups_001)
+{
+    WMWindowList windowList;
+    windowList.m_guiAppcache.emplace(102, WMWindow(new wm_window_t()));
+
+    for (pid_t pid : {101, 102, 103}) {
+        Process proc(pid);
+        proc.d->ppid = 1;
+        proc.d->uid = geteuid();
+        proc.d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE", "/tmp/wxwork.desktop");
+        proc.d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE_PID", "100");
+        proc.setAppType(kFilterApps);
+        m_tester->m_set.insert(pid, proc);
+    }
+
+    Process separateLaunch(104);
+    separateLaunch.d->ppid = 1;
+    separateLaunch.d->uid = geteuid();
+    separateLaunch.d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE", "/tmp/wxwork.desktop");
+    separateLaunch.d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE_PID", "200");
+    separateLaunch.setAppType(kFilterApps);
+    m_tester->m_set.insert(separateLaunch.pid(), separateLaunch);
+
+    const QMap<pid_t, QList<pid_t>> groups =
+            m_tester->collapseDesktopLaunchGroups(&windowList, geteuid());
+
+    ASSERT_EQ(groups.size(), 1);
+    ASSERT_TRUE(groups.contains(102));
+    EXPECT_EQ(groups.value(102).size(), 3);
+    EXPECT_FALSE(groups.value(102).contains(104));
+    EXPECT_EQ(m_tester->m_set.value(102).appType(), kFilterApps);
+    EXPECT_EQ(m_tester->m_set.value(101).appType(), kFilterCurrentUser);
+    EXPECT_EQ(m_tester->m_set.value(103).appType(), kFilterCurrentUser);
+}
+
+TEST_F(UT_ProcessSet, test_collapseDesktopLaunchGroups_keepsSinglePpidTree)
+{
+    WMWindowList windowList;
+    Process root(201);
+    root.d->ppid = 1;
+    root.d->uid = geteuid();
+    Process child(202);
+    child.d->ppid = 1;
+    child.d->uid = geteuid();
+
+    for (Process *proc : {&root, &child}) {
+        proc->d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE", "/tmp/app.desktop");
+        proc->setAppType(kFilterApps);
+        m_tester->m_set.insert(proc->pid(), *proc);
+    }
+
+    // An incomplete launch identity must never be used for grouping.
+    EXPECT_TRUE(m_tester->collapseDesktopLaunchGroups(&windowList, geteuid()).isEmpty());
+
+    m_tester->m_set[201].d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE_PID", "200");
+    m_tester->m_set[202].d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE_PID", "200");
+    m_tester->m_set[202].d->ppid = 201;
+
+    EXPECT_TRUE(m_tester->collapseDesktopLaunchGroups(&windowList, geteuid()).isEmpty());
+    EXPECT_EQ(m_tester->m_set.value(201).appType(), kFilterApps);
+    EXPECT_EQ(m_tester->m_set.value(202).appType(), kFilterApps);
 }
 
 TEST_F(UT_ProcessSet, test_refresh_001)

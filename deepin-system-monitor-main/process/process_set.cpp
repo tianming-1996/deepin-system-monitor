@@ -66,6 +66,120 @@ void ProcessSet::mergeSubProcCpu(pid_t ppid, qreal &cpu)
     cpu += proc.cpu();
 }
 
+void ProcessSet::mergeSubProcMemory(pid_t ppid, qulonglong &memory)
+{
+    auto it = m_pidPtoCMapping.find(ppid);
+    while (it != m_pidPtoCMapping.end() && it.key() == ppid) {
+        mergeSubProcMemory(it.value(), memory);
+        ++it;
+    }
+
+    memory += m_set[ppid].memory();
+}
+
+QMap<pid_t, QList<pid_t>> ProcessSet::collapseDesktopLaunchGroups(WMWindowList *windowList,
+                                                                  uid_t euid)
+{
+    QMap<QPair<QString, qlonglong>, QList<pid_t>> membersByLaunch;
+    for (auto it = m_set.cbegin(); it != m_set.cend(); ++it) {
+        if (it.value().uid() != euid)
+            continue;
+
+        const QHash<QString, QString> environ = it.value().environ();
+        const QString desktopFile = environ.value("GIO_LAUNCHED_DESKTOP_FILE").trimmed();
+        bool ok = false;
+        const qlonglong launchPid =
+                environ.value("GIO_LAUNCHED_DESKTOP_FILE_PID").toLongLong(&ok);
+        if (!desktopFile.isEmpty() && ok && launchPid > 0) {
+            // The desktop file and launcher PID identify one GIO launch while
+            // keeping separate launches of the same application independent.
+            membersByLaunch[qMakePair(desktopFile, launchPid)].append(it.key());
+        }
+    }
+
+    QMap<pid_t, QList<pid_t>> groups;
+    for (auto groupIt = membersByLaunch.cbegin(); groupIt != membersByLaunch.cend(); ++groupIt) {
+        QSet<pid_t> memberPids;
+        for (pid_t pid : groupIt.value())
+            memberPids.insert(pid);
+
+        int rootCount = 0;
+        for (pid_t pid : groupIt.value()) {
+            if (!memberPids.contains(m_set[pid].ppid()))
+                ++rootCount;
+        }
+
+        // A single PPID tree is already handled by the normal recursive path.
+        // The launch identity is only a fallback for re-parented process trees.
+        if (rootCount < 2)
+            continue;
+
+        pid_t representativePid = -1;
+        int representativeScore = -1;
+
+        for (pid_t pid : groupIt.value()) {
+            int score = 0;
+            if (windowList->isGuiApp(pid))
+                score = 3;
+            else if (windowList->isDesktopEntryApp(pid))
+                score = 2;
+            else if (windowList->isTrayApp(pid))
+                score = 1;
+
+            if (score > representativeScore
+                    || (score == representativeScore
+                        && (representativePid < 0 || pid < representativePid))) {
+                representativePid = pid;
+                representativeScore = score;
+            }
+        }
+
+        if (representativePid < 0)
+            continue;
+
+        m_set[representativePid].setAppType(kFilterApps);
+        groups.insert(representativePid, groupIt.value());
+        for (pid_t pid : groupIt.value()) {
+            if (pid == representativePid || m_set[pid].appType() != kFilterApps)
+                continue;
+
+            m_set[pid].setAppType(kFilterCurrentUser);
+            windowList->removeDesktopEntryApp(pid);
+        }
+    }
+
+    return groups;
+}
+
+void ProcessSet::aggregateProcessGroup(pid_t representativePid, const QList<pid_t> &memberPids)
+{
+    if (!m_set.contains(representativePid))
+        return;
+
+    qreal cpu = 0;
+    qreal recvBps = 0;
+    qreal sendBps = 0;
+    qulonglong memory = 0;
+    QSet<pid_t> visited;
+
+    for (pid_t pid : memberPids) {
+        if (visited.contains(pid) || !m_set.contains(pid))
+            continue;
+        visited.insert(pid);
+
+        const Process &proc = m_set[pid];
+        cpu += proc.cpu();
+        recvBps += proc.recvBps();
+        sendBps += proc.sentBps();
+        memory += proc.memory();
+    }
+
+    Process &representative = m_set[representativePid];
+    representative.setCpu(cpu);
+    representative.setNetIoBps(recvBps, sendBps);
+    representative.setMemory(memory);
+}
+
 void ProcessSet::refresh()
 {
     scanProcess();
@@ -91,7 +205,6 @@ void ProcessSet::scanProcess()
     WMWindowList *wmwindowList = ProcessDB::instance()->windowList();
 
     Iterator iter;
-    QList<pid_t> appLst;
     while (iter.hasNext()) {
         Process proc = iter.next();
 
@@ -103,12 +216,9 @@ void ProcessSet::scanProcess()
     if(m_prePid != m_curPid) {
         for (const pid_t &pid : m_prePid) {
             if(!m_curPid.contains(pid)){
-                m_prePid.removeAt(pid);  //remove disappear process pid
                 if(m_simpleSet.contains(pid))
                     m_simpleSet.remove(pid);
-                //for each pid,only one process reflected.So "removeOne()"func replied.
-                if(m_pidMyApps.contains(pid))
-                    m_pidMyApps.removeOne(pid);
+                m_pidMyApps.removeOne(pid);
             }
         }
 
@@ -119,9 +229,8 @@ void ProcessSet::scanProcess()
                 if(!m_simpleSet.contains(pid))
                      m_simpleSet.insert(proc.pid(), proc);
 
-                if (proc.appType() == kFilterApps && !wmwindowList->isTrayApp(proc.pid())) {
-                     m_pidMyApps << proc.pid();
-                }
+                if (proc.appType() == kFilterApps && !wmwindowList->isTrayApp(proc.pid()))
+                    m_pidMyApps.append(proc.pid());
             }
         }
         m_prePid = m_curPid;
@@ -146,27 +255,54 @@ void ProcessSet::scanProcess()
         }
     }
 
-    std::function<bool(pid_t ppid)> anyRootIsGuiProc;
+    const QMap<pid_t, QList<pid_t>> launchGroups =
+            collapseDesktopLaunchGroups(wmwindowList, ProcessDB::instance()->processEuid());
+
+    // A split launch can choose a tray process or a previously hidden member
+    // as its representative, neither of which is guaranteed to be in this list.
+    for (auto it = launchGroups.cbegin(); it != launchGroups.cend(); ++it) {
+        if (!m_pidMyApps.contains(it.key()))
+            m_pidMyApps.append(it.key());
+    }
+
     // find if any ancestor processes is gui application
-    anyRootIsGuiProc = [&](pid_t ppid) -> bool {
-        bool b;
-        b = wmwindowList->isGuiApp(ppid);
-        if (!b && m_pidCtoPMapping.contains(ppid))
-        {
-            b = anyRootIsGuiProc(m_pidCtoPMapping[ppid]);
+    auto anyRootIsGuiProc = [&](pid_t ppid) -> bool {
+        QSet<pid_t> visited;
+        while (!visited.contains(ppid)) {
+            visited.insert(ppid);
+            if (wmwindowList->isGuiApp(ppid))
+                return true;
+            if (!m_pidCtoPMapping.contains(ppid))
+                break;
+            ppid = m_pidCtoPMapping.value(ppid);
         }
-        return b;
+        return false;
     };
 
     for (const pid_t &pid : m_pidMyApps) {
-        qreal recvBps = 0;
-        qreal sendBps = 0;
-        mergeSubProcNetIO(pid, recvBps, sendBps);
-        m_set[pid].setNetIoBps(recvBps, sendBps);
+        if (!m_set.contains(pid) || m_set[pid].appType() != kFilterApps)
+            continue;
 
-        qreal ptotalCpu = 0.;
-        mergeSubProcCpu(pid, ptotalCpu);
-        m_set[pid].setCpu(ptotalCpu);
+        if (launchGroups.contains(pid)) {
+            aggregateProcessGroup(pid, launchGroups.value(pid));
+        } else {
+            qreal recvBps = 0;
+            qreal sendBps = 0;
+            mergeSubProcNetIO(pid, recvBps, sendBps);
+            m_set[pid].setNetIoBps(recvBps, sendBps);
+
+            qreal totalCpu = 0;
+            mergeSubProcCpu(pid, totalCpu);
+            m_set[pid].setCpu(totalCpu);
+
+            qulonglong totalMemory = 0;
+            mergeSubProcMemory(pid, totalMemory);
+            m_set[pid].setMemory(totalMemory);
+        }
+
+        // A split launch is already represented by this single selected PID.
+        if (launchGroups.contains(pid))
+            continue;
 
         if (!wmwindowList->isGuiApp(pid))
         {

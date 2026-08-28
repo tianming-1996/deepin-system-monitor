@@ -10,6 +10,7 @@
 #include "common/common.h"
 
 #include <QMap>
+#include <QSet>
 
 #include <dirent.h>
 
@@ -17,6 +18,10 @@ using namespace common::alloc;
 
 // class Settings;
 namespace core {
+namespace wm {
+class WMWindowList;
+}
+
 namespace process {
 
 enum FilterType { kFilterApps,
@@ -54,6 +59,10 @@ private:
     void scanProcess();
     void mergeSubProcNetIO(pid_t ppid, qreal &recvBps, qreal &sendBps);
     void mergeSubProcCpu(pid_t ppid, qreal &cpu);
+    void mergeSubProcMemory(pid_t ppid, qulonglong &memory);
+    QMap<pid_t, QList<pid_t>> collapseDesktopLaunchGroups(
+            core::wm::WMWindowList *windowList, uid_t euid);
+    void aggregateProcessGroup(pid_t representativePid, const QList<pid_t> &memberPids);
 
     class Iterator
     {

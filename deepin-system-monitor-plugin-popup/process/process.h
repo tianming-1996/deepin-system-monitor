@@ -77,6 +77,7 @@ public:
     void setCpu(qreal cpu);
 
     qulonglong memory() const;
+    void setMemory(qulonglong memory);
     qulonglong vtrmemory() const;
     qulonglong sharememory() const;
 
