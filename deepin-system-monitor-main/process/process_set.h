@@ -10,6 +10,7 @@
 #include "common/common.h"
 
 #include <QMap>
+#include <QSet>
 
 #include <dirent.h>
 
@@ -64,10 +65,16 @@ public:
 
 private:
     void scanProcess();
-    void mergeSubProcNetIO(pid_t ppid, qreal &recvBps, qreal &sendBps);
-    void mergeSubProcCpu(pid_t ppid, qreal &cpu);
-    void mergeSubProcMemory(pid_t ppid, qulonglong &memory);
+    void mergeSubProcNetIO(pid_t ppid, qreal &recvBps, qreal &sendBps,
+                           const QSet<pid_t> &excludedPids = {});
+    void mergeSubProcCpu(pid_t ppid, qreal &cpu,
+                         const QSet<pid_t> &excludedPids = {});
+    void mergeSubProcMemory(pid_t ppid, qulonglong &memory,
+                            const QSet<pid_t> &excludedPids = {});
     QMap<pid_t, QList<pid_t>> collapseDesktopLaunchGroups(
+            core::wm::WMWindowList *windowList, uid_t euid,
+            const QSet<pid_t> &reserved = {});
+    QMap<pid_t, QList<pid_t>> collapseWineContainerGroups(
             core::wm::WMWindowList *windowList, uid_t euid);
     void aggregateProcessGroup(pid_t representativePid, const QList<pid_t> &memberPids);
 

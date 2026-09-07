@@ -270,10 +270,251 @@ TEST_F(UT_ProcessSet, test_collapseDesktopLaunchGroups_includesDescendantsWithou
     EXPECT_EQ(resource.memory, 50U);
 }
 
-TEST_F(UT_ProcessSet, test_refresh_001)
+TEST_F(UT_ProcessSet, test_desktopLaunchGroup_excludesMembersFromAncestorResources)
 {
-    m_tester->refresh();
+    WMWindowList windowList;
+    windowList.m_guiAppcache.emplace(102, WMWindow(new wm_window_t()));
+
+    Process launcher(100);
+    launcher.d->ppid = 1;
+    launcher.d->uid = geteuid();
+    launcher.d->rss = 10;
+    launcher.setCpu(1);
+    launcher.setNetIoBps(2, 3);
+    launcher.setAppType(kFilterApps);
+
+    Process groupRoot(101);
+    groupRoot.d->ppid = launcher.pid();
+    groupRoot.d->uid = geteuid();
+    groupRoot.d->rss = 20;
+    groupRoot.setCpu(4);
+    groupRoot.setNetIoBps(5, 6);
+    groupRoot.setAppType(kFilterApps);
+
+    Process groupGui(102);
+    groupGui.d->ppid = groupRoot.pid();
+    groupGui.d->uid = geteuid();
+    groupGui.d->rss = 30;
+    groupGui.setCpu(7);
+    groupGui.setNetIoBps(8, 9);
+    groupGui.setAppType(kFilterApps);
+
+    for (Process *proc : {&groupRoot, &groupGui}) {
+        proc->d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE", "/tmp/app.desktop");
+        proc->d->environ.insert("GIO_LAUNCHED_DESKTOP_FILE_PID", "100");
+    }
+
+    m_tester->m_set.insert(launcher.pid(), launcher);
+    m_tester->m_set.insert(groupRoot.pid(), groupRoot);
+    m_tester->m_set.insert(groupGui.pid(), groupGui);
+    m_tester->m_pidPtoCMapping.insert(launcher.pid(), groupRoot.pid());
+    m_tester->m_pidPtoCMapping.insert(groupRoot.pid(), groupGui.pid());
+
+    const QMap<pid_t, QList<pid_t>> groups =
+            m_tester->collapseDesktopLaunchGroups(&windowList, geteuid());
+    ASSERT_EQ(groups.size(), 1);
+    ASSERT_TRUE(groups.contains(groupGui.pid()));
+    EXPECT_EQ(groups.value(groupGui.pid()), QList<pid_t>({101, 102}));
+
+    QSet<pid_t> groupedPids;
+    for (auto it = groups.cbegin(); it != groups.cend(); ++it) {
+        groupedPids.insert(it.key());
+        for (pid_t pid : it.value())
+            groupedPids.insert(pid);
+    }
+
+    qreal recvBps = 0;
+    qreal sentBps = 0;
+    qreal cpu = 0;
+    qulonglong memory = 0;
+    m_tester->mergeSubProcNetIO(launcher.pid(), recvBps, sentBps, groupedPids);
+    m_tester->mergeSubProcCpu(launcher.pid(), cpu, groupedPids);
+    m_tester->mergeSubProcMemory(launcher.pid(), memory, groupedPids);
+
+    // The launcher owns only its own resources; the desktop launch group owns
+    // the resources of groupRoot and groupGui.
+    EXPECT_DOUBLE_EQ(recvBps, 2);
+    EXPECT_DOUBLE_EQ(sentBps, 3);
+    EXPECT_DOUBLE_EQ(cpu, 1);
+    EXPECT_EQ(memory, 10U);
+
+    m_tester->aggregateProcessGroup(groupGui.pid(), groups.value(groupGui.pid()));
+    const ApplicationResource groupResource =
+            m_tester->getApplicationResources().value(groupGui.pid());
+    EXPECT_DOUBLE_EQ(groupResource.recvBps, 13);
+    EXPECT_DOUBLE_EQ(groupResource.sentBps, 15);
+    EXPECT_DOUBLE_EQ(groupResource.cpu, 11);
+    EXPECT_EQ(groupResource.memory, 50U);
 }
+
+TEST_F(UT_ProcessSet, test_collapseWineContainerGroups_mergesAcrossLaunches)
+{
+    WMWindowList windowList;
+    windowList.m_guiAppcache.emplace(102, WMWindow(new wm_window_t()));
+    windowList.m_guiAppcache.emplace(202, WMWindow(new wm_window_t()));
+
+    auto add = [&](pid_t pid, pid_t ppid, const char *package, const char *prefix) {
+        Process proc(pid);
+        proc.d->ppid = ppid;
+        proc.d->uid = geteuid();
+        proc.d->cmdline << "c:\\Program Files (x86)\\WXWork\\WXWork.exe";
+        proc.d->environ.insert("DEB_PACKAGE_NAME", package);
+        proc.d->environ.insert("WINEPREFIX", prefix);
+        proc.setAppType(kFilterApps);
+        m_tester->m_set.insert(pid, proc);
+    };
+
+    const char *package = "com.qq.weixin.work.deepin";
+    const char *prefix = "/home/ut006498@uos/.deepinwine/Deepin-WXWork";
+    // First launch: GUI plus re-parented members, all PPID=1.
+    add(101, 1, package, prefix);
+    add(102, 1, package, prefix);
+    add(103, 1, package, prefix);
+    // Second launch of the same logical app in the same container.
+    add(201, 1, package, prefix);
+    add(202, 1, package, prefix);
+
+    const QMap<pid_t, QList<pid_t>> groups =
+            m_tester->collapseWineContainerGroups(&windowList, geteuid());
+
+    ASSERT_EQ(groups.size(), 1);
+    ASSERT_TRUE(groups.contains(102));
+    EXPECT_EQ(groups.value(102), QList<pid_t>({101, 102, 103, 201, 202}));
+    EXPECT_EQ(m_tester->m_set.value(102).appType(), kFilterApps);
+    for (pid_t pid : {101, 103, 201, 202})
+        EXPECT_EQ(m_tester->m_set.value(pid).appType(), kFilterCurrentUser);
+}
+
+TEST_F(UT_ProcessSet, test_collapseWineContainerGroups_excludesNativeChildren)
+{
+    WMWindowList windowList;
+    windowList.m_guiAppcache.emplace(102, WMWindow(new wm_window_t()));
+
+    auto addWine = [&](pid_t pid, const char *exe) {
+        Process proc(pid);
+        proc.d->ppid = 1;
+        proc.d->uid = geteuid();
+        proc.d->cmdline << exe;
+        proc.d->environ.insert("DEB_PACKAGE_NAME", "com.qq.weixin.work.deepin");
+        proc.d->environ.insert("WINEPREFIX", "/home/user/.deepinwine/Deepin-WXWork");
+        proc.setAppType(kFilterApps);
+        m_tester->m_set.insert(pid, proc);
+    };
+
+    addWine(101, "c:\\Program Files (x86)\\WXWork\\WXWork.exe");
+    addWine(102, "C:\\windows\\system32\\services.exe");
+
+    // Wine host: carries the container environment but no .exe command line;
+    // it must still be folded into the wine application.
+    Process host(104);
+    host.d->ppid = 1;
+    host.d->uid = geteuid();
+    host.d->name = "wineserver";
+    host.d->cmdline << "/opt/apps/com.qq.weixin.work.deepin/files/dlls/wineserver";
+    host.d->environ.insert("DEB_PACKAGE_NAME", "com.qq.weixin.work.deepin");
+    host.d->environ.insert("WINEPREFIX", "/home/user/.deepinwine/Deepin-WXWork");
+    host.setAppType(kFilterApps);
+    m_tester->m_set.insert(host.pid(), host);
+
+    // Native process spawned from inside the container: inherits the wine
+    // environment but is not a Windows program, so it must stay independent.
+    // A "setup.exe" is only an argument; the process executable is native.
+    Process native(103);
+    native.d->ppid = 1;
+    native.d->uid = geteuid();
+    native.d->cmdline << "/usr/bin/dde-file-manager"
+                      << "/tmp/setup.exe";
+    native.d->environ.insert("DEB_PACKAGE_NAME", "com.qq.weixin.work.deepin");
+    native.d->environ.insert("WINEPREFIX", "/home/user/.deepinwine/Deepin-WXWork");
+    native.setAppType(kFilterApps);
+    m_tester->m_set.insert(native.pid(), native);
+
+    const QMap<pid_t, QList<pid_t>> groups =
+            m_tester->collapseWineContainerGroups(&windowList, geteuid());
+
+    ASSERT_EQ(groups.size(), 1);
+    ASSERT_TRUE(groups.contains(102));
+    EXPECT_EQ(groups.value(102), QList<pid_t>({101, 102, 104}));
+    EXPECT_EQ(m_tester->m_set.value(102).appType(), kFilterApps);
+    EXPECT_EQ(m_tester->m_set.value(101).appType(), kFilterCurrentUser);
+    EXPECT_EQ(m_tester->m_set.value(104).appType(), kFilterCurrentUser);
+    EXPECT_EQ(m_tester->m_set.value(103).appType(), kFilterApps);
+}
+
+TEST_F(UT_ProcessSet, test_collapseWineContainerGroups_reelectsSurvivorAfterRepExit)
+{
+    WMWindowList windowList;
+    windowList.m_guiAppcache.emplace(102, WMWindow(new wm_window_t()));
+    windowList.m_guiAppcache.emplace(202, WMWindow(new wm_window_t()));
+
+    auto add = [&](pid_t pid, pid_t ppid) {
+        Process proc(pid);
+        proc.d->ppid = ppid;
+        proc.d->uid = geteuid();
+        proc.d->cmdline << "c:\\Program Files (x86)\\WXWork\\WXWork.exe";
+        proc.d->environ.insert("DEB_PACKAGE_NAME", "com.qq.weixin.work.deepin");
+        proc.d->environ.insert("WINEPREFIX", "/home/ut006498@uos/.deepinwine/Deepin-WXWork");
+        proc.setAppType(kFilterApps);
+        m_tester->m_simpleSet.insert(pid, proc);
+        m_tester->m_set.insert(pid, proc);
+    };
+
+    add(101, 1);
+    add(102, 1);
+    add(201, 1);
+    add(202, 1);
+
+    // First scan: PID 102 (smaller GUI pid) is the representative.
+    QMap<pid_t, QList<pid_t>> groups =
+            m_tester->collapseWineContainerGroups(&windowList, geteuid());
+    ASSERT_TRUE(groups.contains(102));
+    EXPECT_EQ(m_tester->m_set.value(102).appType(), kFilterApps);
+    EXPECT_EQ(m_tester->m_set.value(202).appType(), kFilterCurrentUser);
+
+    // The representative is terminated; only PID 202 (a windowed instance of
+    // the same container) keeps running.
+    m_tester->m_set.remove(102);
+
+    // A new scan rebuilds m_set from the untouched birth-time cache
+    // (m_simpleSet), which is what makes demoted members eligible again.
+    m_tester->m_set.clear();
+    for (pid_t pid : {101, 201, 202})
+        m_tester->m_set.insert(pid, m_tester->m_simpleSet.value(pid));
+
+    groups = m_tester->collapseWineContainerGroups(&windowList, geteuid());
+
+    ASSERT_EQ(groups.size(), 1);
+    ASSERT_TRUE(groups.contains(202));
+    EXPECT_EQ(groups.value(202), QList<pid_t>({101, 201, 202}));
+    EXPECT_EQ(m_tester->m_set.value(202).appType(), kFilterApps);
+}
+
+TEST_F(UT_ProcessSet, test_collapseWineContainerGroups_requiresBothVariables)
+{
+    WMWindowList windowList;
+    Process proc(101);
+    proc.d->ppid = 1;
+    proc.d->uid = geteuid();
+    proc.d->cmdline << "c:\\Program Files (x86)\\WXWork\\WXWork.exe";
+    // Raw wine: WINEPREFIX only, no DEB_PACKAGE_NAME.
+    proc.d->environ.insert("WINEPREFIX", "/home/user/.wine");
+    proc.setAppType(kFilterApps);
+    m_tester->m_set.insert(101, proc);
+
+    Process proc2(102);
+    proc2.d->ppid = 1;
+    proc2.d->uid = geteuid();
+    proc2.d->cmdline << "c:\\Program Files (x86)\\WXWork\\WXWork.exe";
+    // DEB_PACKAGE_NAME only, no WINEPREFIX (outer launcher shell).
+    proc2.d->environ.insert("DEB_PACKAGE_NAME", "com.qq.weixin.work.deepin");
+    proc2.setAppType(kFilterApps);
+    m_tester->m_set.insert(102, proc2);
+
+    EXPECT_TRUE(m_tester->collapseWineContainerGroups(&windowList, geteuid()).isEmpty());
+    EXPECT_EQ(m_tester->m_set.value(101).appType(), kFilterApps);
+    EXPECT_EQ(m_tester->m_set.value(102).appType(), kFilterApps);
+}
+
 
 TEST_F(UT_ProcessSet, test_scanProcess_001)
 {

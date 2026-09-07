@@ -56,6 +56,10 @@ public:
     Process &operator=(const Process &rhs);
     ~Process();
 
+    // Make a private copy of the shared data so that later writes (e.g.
+    // setAppType) do not affect other Process instances that share it.
+    void detach();
+
     bool isValid() const;
 
     pid_t pid() const;
